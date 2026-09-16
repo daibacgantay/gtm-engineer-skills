@@ -137,7 +137,7 @@ The dashboard's Query Fan-Out page reads `prompt_runs.web_queries` — record pe
 
 | Engine | What to record in `engines.<E>.web_queries` |
 |---|---|
-| Google AIO | Related-search / source-chip query strings visible in the AIO block, verbatim. None visible → `[]`. |
+| Google AIO | `NO_AI_OVERVIEW` or no citations → `[]`. Grounded answer WITH citations / source chips but no visible query strings → `["unavailable"]` (same sentinel semantics as the other engines; AIO is grounded by definition). |
 | ChatGPT / Gemini / Grok / Claude (manual pilot, no search API) | `[]` by default. `["unavailable"]` ONLY when the answer is clearly grounded (citations / source chips present) but no query strings are visible. |
 | Any engine | Marker cells (`rate_limited`, `login_required`, `error`, `refused`, `no_ai_overview`) get no `web_queries` — the absence is the signal. |
 
