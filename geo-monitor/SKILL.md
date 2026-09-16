@@ -78,6 +78,7 @@ for each prompt P (in prompts.csv order, minus skip rows):
     for each engine E (chatgpt → gemini → google → grok → claude):
         submit(P, E)                  # type + Enter, then wait for stream to complete
         extract(E), verdict(E)        # evaluate_script to get innerText + compute mentioned/position
+        save_answer(E)                # full innerText → rows.json engines.<E>.answer_text (+answer_links)
         render_transcript(E)          # save .txt + render PNG via render_evidence.ps1
     append_and_save(P, verdicts)      # write row + re-save SUMMARY sheet
 ```
@@ -125,9 +126,10 @@ After submitting, poll with `evaluate_script`: read the last assistant-message c
    - `pages_cited` (always): any brand-owned URL/domain appearing in the answer text or source chips (e.g. `torder.net/...` in AIO sources). Mention ≠ citation — both are tracked (book ch.13).
    - `accuracy_flags` (only on `branded=true` rows): compare stated facts against brand_dna.md (founding year, address, MST, agency status, policies). Record only concrete mismatches as short text ("domain 2023 vs 2021", "wrong address"); otherwise empty. Accuracy is a RAPP pillar and drifts silently.
 4. Save a marked-up transcript to `monitor/transcripts/row<r>-<engine>.txt` — line prefixes: `# ` heading, `- ` bullet, `> ` quote, plain paragraph.
-5. Render to `monitor/geo_monitor_<DATE>/<r>-<engine>.png` with `render_evidence.ps1` (GDI+, 1500 px wide, 4-column newspaper layout, ClearType, full Vietnamese diacritics):
+5. Persist the full answer to `monitor/rows_<DATE>.json` at `engines.<engine>.answer_text` — the raw `innerText` from step 1, untruncated (a timed-out stream is noted in row `notes`, never silently cut) — plus `answer_links` when the answer carries source chips (AIO source cards, ChatGPT/Grok citations). Marker cells (`rate_limited`, `login_required`, `error`, `refused`, `no_ai_overview`) get no `answer_text` — the absence is the signal.
+6. Render to `monitor/geo_monitor_<DATE>/<r>-<engine>.png` with `render_evidence.ps1` (GDI+, 1500 px wide, 4-column newspaper layout, ClearType, full Vietnamese diacritics):
    `powershell -File render_evidence.ps1 -txtPath <transcript> -pngPath <png> -header "ROW <r> | <ENGINE> | GEO-MONITOR <domain> | <date> | VERDICT: <mentioned, position>"`
-6. No image for the engine → the result cell holds the marker text (`rate_limited`, `login_required`, `error`, `refused`).
+7. No image for the engine → the result cell holds the marker text (`rate_limited`, `login_required`, `error`, `refused`).
 
 The transcript PNG is the canonical cell image.
 
@@ -157,6 +159,8 @@ prompt,branded,chatgpt_result,chatgpt_mentioned,chatgpt_position,gemini_result,g
 | `notes` | refusal text, AIO source-card nuance, alias-rule applied, etc. |
 
 Row height ≈ 380 pt, result columns width ≈ 44 — sized so the embedded image is readable when the file is opened. Answer text is never stored anywhere in the workbook.
+
+**`rows.json` v2.1** — the machine-readable companion (`monitor/rows_<DATE>.json`, what `build_xlsx_v2.ps1` rebuilds from): each engine cell gains two optional fields, `answer_text` (full answer `innerText`, step 5 above) and `answer_links` (source-chip URLs). Backward compatible — older importers ignore unknown fields. The marked-up transcript `.txt` remains the canonical evidence; `answer_text` is the queryable copy that feeds Prompt History in the dashboard.
 
 **Sheet `SUMMARY`** — recomputed after every append, row 1 headers:
 
