@@ -78,7 +78,7 @@ for each prompt P (in prompts.csv order, minus skip rows):
     for each engine E (chatgpt → gemini → google → grok → claude):
         submit(P, E)                  # type + Enter, then wait for stream to complete
         extract(E), verdict(E)        # evaluate_script to get innerText + compute mentioned/position
-        save_answer(E)                # full innerText → rows.json engines.<E>.answer_text (+answer_links)
+        save_answer(E)                # full innerText + observed queries → rows.json engines.<E>.answer_text (+answer_links, +web_queries)
         render_transcript(E)          # save .txt + render PNG via render_evidence.ps1
     append_and_save(P, verdicts)      # write row + re-save SUMMARY sheet
 ```
@@ -131,6 +131,18 @@ After submitting, poll with `evaluate_script`: read the last assistant-message c
    `powershell -File render_evidence.ps1 -txtPath <transcript> -pngPath <png> -header "ROW <r> | <ENGINE> | GEO-MONITOR <domain> | <date> | VERDICT: <mentioned, position>"`
 7. No image for the engine → the result cell holds the marker text (`rate_limited`, `login_required`, `error`, `refused`).
 
+### Query fan-out capture (`web_queries`)
+
+The dashboard's Query Fan-Out page reads `prompt_runs.web_queries` — record per engine only what you actually SEE, never invent queries:
+
+| Engine | What to record in `engines.<E>.web_queries` |
+|---|---|
+| Google AIO | Related-search / source-chip query strings visible in the AIO block, verbatim. None visible → `[]`. |
+| ChatGPT / Gemini / Grok / Claude (manual pilot, no search API) | `[]` by default. `["unavailable"]` ONLY when the answer is clearly grounded (citations / source chips present) but no query strings are visible. |
+| Any engine | Marker cells (`rate_limited`, `login_required`, `error`, `refused`, `no_ai_overview`) get no `web_queries` — the absence is the signal. |
+
+Store raw: a query identical to the prompt is filtered at read time, so never pre-filter. `["unavailable"]` is elmo's sentinel for "search happened, strings hidden" — every fan-out read path excludes it.
+
 The transcript PNG is the canonical cell image.
 
 ## Phase 4: XLSX schema (strict)
@@ -160,7 +172,7 @@ prompt,branded,chatgpt_result,chatgpt_mentioned,chatgpt_position,gemini_result,g
 
 Row height ≈ 380 pt, result columns width ≈ 44 — sized so the embedded image is readable when the file is opened. Answer text is never stored anywhere in the workbook.
 
-**`rows.json` v2.1** — the machine-readable companion (`monitor/rows_<DATE>.json`, what `build_xlsx_v2.ps1` rebuilds from): each engine cell gains two optional fields, `answer_text` (full answer `innerText`, step 5 above) and `answer_links` (source-chip URLs). Backward compatible — older importers ignore unknown fields. The marked-up transcript `.txt` remains the canonical evidence; `answer_text` is the queryable copy that feeds Prompt History in the dashboard.
+**`rows.json` v2.2** — the machine-readable companion (`monitor/rows_<DATE>.json`, what `build_xlsx_v2.ps1` rebuilds from): each engine cell gains three optional fields, `answer_text` (full answer `innerText`, step 5 above), `answer_links` (source-chip URLs), and `web_queries` (string[] — observed sub-queries, or `["unavailable"]` when grounded but unobservable; see capture table above). Backward compatible — older importers ignore unknown fields. The marked-up transcript `.txt` remains the canonical evidence; `answer_text` is the queryable copy that feeds Prompt History in the dashboard, `web_queries` feeds Query Fan-Out.
 
 **Sheet `SUMMARY`** — recomputed after every append, row 1 headers:
 
