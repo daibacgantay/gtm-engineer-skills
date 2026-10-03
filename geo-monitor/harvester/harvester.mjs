@@ -36,7 +36,8 @@ const RELATED_MARKERS = [
 	"Mọi người tìm kiếm",
 ];
 const SELF_HOSTS = ["google.com", "gstatic.com", "googleusercontent.com"];
-const BLOCK_PATTERN = /unusual traffic|not a robot|CAPTCHA|captcha|verify you are a human/i;
+const BLOCK_PATTERN =
+	/unusual traffic|lưu lượng truy cập bất thường|not a robot|CAPTCHA|verify you are a human|kiểm tra xem bạn có đúng là người/i;
 
 function arg(name, fallback) {
 	const i = process.argv.indexOf(`--${name}`);
@@ -199,9 +200,16 @@ async function extractAio(page) {
 }
 
 async function pageLooksBlocked(page) {
+	if (/\/sorry\//.test(page.url())) return true;
+	const text = await page.evaluate(() => (document.body?.innerText || "").slice(0, 4000));
+	return BLOCK_PATTERN.test(text);
+}
+
+/** Distinguishes a real (if AIO-less) SERP from a failed/blank/consent page. */
+async function pageHasSearchResults(page) {
 	return page.evaluate(() => {
-		const t = (document.body?.innerText || "").slice(0, 4000);
-		return /unusual traffic|not a robot|CAPTCHA/i.test(t) || /sorry/i.test(document.title);
+		if (document.querySelector("#rso, #search, #rcnt, #botstuff")) return true;
+		return (document.body?.innerText || "").length > 800;
 	});
 }
 
@@ -210,6 +218,7 @@ async function runPrompt(page, prompt) {
 	await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
 	await page.waitForTimeout(2500);
 	if (await pageLooksBlocked(page)) throw new Error("BLOCKED_CAPTCHA");
+	if (!(await pageHasSearchResults(page))) throw new Error("NO_RESULTS_PAGE");
 
 	const started = Date.now();
 	let last = null;
