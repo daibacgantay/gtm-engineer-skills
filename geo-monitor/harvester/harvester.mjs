@@ -52,21 +52,32 @@ const OPT = {
 	aliases: arg("aliases", undefined),
 	out: arg("out", undefined),
 	limit: Number(arg("limit", "0")),
-	tabs: Math.max(1, Number(arg("tabs", "2"))),
+	tabs: Math.max(1, Number(arg("tabs", "1"))),
 	hl: arg("hl", "vi"),
 	timeoutMs: Number(arg("timeout", "90")) * 1000,
 	noAioWaitMs: Number(arg("no-aio-grace", "15")) * 1000,
-	gapMinMs: Number(arg("gap-min", "8")) * 1000,
-	gapMaxMs: Number(arg("gap-max", "16")) * 1000,
+	gapMinMs: Number(arg("gap-min", "30")) * 1000,
+	gapMaxMs: Number(arg("gap-max", "75")) * 1000,
+	batch: Math.max(0, Number(arg("batch", "0"))),
+	batchGapMs: Number(arg("batch-gap", "240")) * 1000,
 	resume: arg("resume", false) === true,
 };
 
 if (!OPT.prompts || !OPT.aliases || !OPT.out) {
 	console.error(
 		"usage: node harvester.mjs --prompts <csv> --aliases \"a,b,c\" --out <rows.json> " +
-			"[--cdp http://127.0.0.1:9222] [--limit N] [--tabs 2] [--hl vi] [--timeout 90] [--resume]",
+			"[--cdp http://127.0.0.1:9222] [--limit N] [--tabs 1] [--hl vi] [--timeout 90] " +
+			"[--gap-min 30] [--gap-max 75] [--batch N] [--batch-gap 240] [--resume]",
 	);
 	process.exit(1);
+}
+
+if (OPT.tabs > 1) {
+	console.error(
+		"[harvest] WARNING: concurrent AIO tabs tripped Google's IP-level 'unusual traffic' block " +
+			"on 2026-10-03. The manual round-robin never did because each engine saw one query every " +
+			"few minutes. Prefer --tabs 1 with gap pacing; only raise it if verified safe for this IP/account.",
+	);
 }
 
 // ---------------------------------------------------------------- prompts.csv
@@ -359,7 +370,13 @@ async function main() {
 					`"${prompt.slice(0, 44)}" → ${m}${m === "yes" ? "/" + row.engines.google.position : ""} len=${len} chips=${row.engines.google.web_queries?.length ?? 0}`,
 			);
 			flush();
-			await page.waitForTimeout(OPT.gapMinMs + Math.random() * Math.max(0, OPT.gapMaxMs - OPT.gapMinMs));
+			if (OPT.batch > 0 && completed % OPT.batch === 0 && queue.length > 0) {
+				const pause = Math.round(OPT.batchGapMs * (0.8 + Math.random() * 0.4));
+				console.error(`[harvest] batch pause ${Math.round(pause / 1000)}s after ${completed} runs`);
+				await page.waitForTimeout(pause);
+			} else {
+				await page.waitForTimeout(OPT.gapMinMs + Math.random() * Math.max(0, OPT.gapMaxMs - OPT.gapMinMs));
+			}
 		}
 		await page.close().catch(() => {});
 	}
