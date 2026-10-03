@@ -30,6 +30,13 @@ small pool of concurrent tabs.
   (AIO is search-style so it tolerates more parallelism than chat engines).
   On a CAPTCHA/"unusual traffic" page the run stops with exit code 2 —
   login/CAPTCHA is the human's job; resume later with `--resume`.
+- **Rate-limit reality (learned 2026-10-03):** a burst of ~40 searches in
+  ~40 min (smoke + 3-tab full run) tripped Google's `/sorry` "unusual
+  traffic" page — it is **IP-wide** (personal browsing on google.com may
+  also see the challenge until it clears, usually minutes–hours). Blocked
+  pages are now detected (URL + VI/EN patterns) and cells become `error`,
+  never a false `no_ai_overview`. For real runs prefer **2 tabs, 20–40 s
+  gaps**; the block does not clear faster by retrying.
 - **Output:** appends rows incrementally to `--out` (flush after every prompt),
   so a crash or Ctrl+C loses nothing already captured.
 
