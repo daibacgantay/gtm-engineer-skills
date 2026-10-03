@@ -1,46 +1,36 @@
-# geo-harvester (spike v0.1)
+# geo-harvester (spike v0.2)
 
-Scripted capture of **Google AI Overview** answers via CDP, writing
-`rows.json` v2.2-compatible rows. It replaces the *manual* MCP-driven typing
-loop for the one engine whose prompts can travel as URLs — Google.
+Scripted capture of AI answers over CDP into the logged-in pilot Chrome,
+writing `rows.json` v2.2-compatible rows. Engines: **google (AIO), chatgpt,
+gemini, claude, grok**. The SKILL.md manual pilot remains the fallback and
+the source of the per-engine mechanics (fresh conversation per prompt,
+slice-only alias scanning, marker cells — never guesses).
 
-This is a spike: the whole directory is removable (`rm -rf`) and SKILL.md
-manual pilot remains the fallback for every engine. Nothing here is installed
-into the skill contract yet.
+This is a spike: the directory is removable (`rm -rf`), nothing is wired into
+the skill contract yet, and the chat engines have NOT completed a live
+validation run (see Status).
 
-## Why
+## Concurrency model — the lesson of 2026-10-03
 
-The pilot run at 30 prompts × 5 engines ≈ 150 captures is dominated by
-wait-for-stream time, and each capture costs an LLM round-trip when driven via
-chrome-devtools MCP. Google AIO needs no typing at all — the prompt *is* a
-URL. Scripting it moves the wait out of the agent loop entirely and enables a
-small pool of concurrent tabs.
+**Parallel ACROSS engines, sequential WITHIN one engine.** Each engine gets
+one worker tab running the prompt list one query at a time with randomized
+human-like gaps (google ~30–75 s, chat engines ~90–180 s). That mirrors the
+manual round-robin's rhythm, which never tripped a limit across T0 + re-runs.
 
-## How
+A 3-tab burst against Google alone (~40 searches in ~40 min) hit Google's
+**IP-wide** `/sorry` "unusual traffic" block AND escalated Cloudflare
+challenges on chatgpt/claude/grok within the hour — personal browsing from
+the same IP sees them too. They clear on their own (minutes to hours);
+retrying does not speed that up.
 
-- **Connect-only.** `chromium.connectOverCDP` into the already-running,
-  already-logged-in pilot Chrome (`--user-data-dir=gtm-pilot-chrome`, default
-  `http://127.0.0.1:9222`; point `--cdp` elsewhere if the port moved).
-  It never launches a browser, never binds/kills the debugging port.
-- **Measurement laws honored:** one fresh search URL per prompt (never a
-  follow-up); alias scan only over the captured AIO slice; failed cells get
-  markers (`error`, `no_ai_overview`), never guesses; `web_queries` recorded
-  raw from visible related-search chips (sentinel meaning unchanged).
-- **Pace (sequential by design):** 1 tab, random 30–75 s gap after each run,
-  optional `--batch N --batch-gap S` to insert a longer pause every N runs
-  (e.g. `--batch 10 --batch-gap 300` for overnight runs). This mirrors the
-  manual round-robin's rhythm: the speedup comes from removing the agent /
-  tool round-trips, not from concurrency. One AIO query every ~30–75 s for
-  hours is indistinguishable from human use.
-- **Rate-limit reality (learned 2026-10-03):** a burst of ~40 searches in
-  ~40 min (smoke + 3-tab full run) tripped Google's `/sorry` "unusual
-  traffic" page — it is **IP-wide** (personal browsing on google.com may
-  also see the challenge until it clears, usually minutes–hours). Blocked
-  pages are now detected (URL + VI/EN patterns) and cells become `error`,
-  never a false `no_ai_overview`. On a block the run stops with exit 2;
-  resume later with `--resume`. The block does not clear faster by retrying.
-- **Output:** appends rows incrementally to `--out` (flush after every prompt),
-  so a crash or Ctrl+C loses nothing already captured.
+Safeguards baked in:
+- `/sorry` URL + VI/EN block patterns and blank-page/challenge detection →
+  `error` cell, never a false `no_ai_overview`;
+- login-wall detection → `login_required` cell (human's job);
+- **circuit breaker**: an engine stops itself after 2 consecutive errors —
+  it never grinds the whole list against a wall; other engines continue;
+- every cell flushes to `--out` immediately; `--resume` skips cells that
+  already have a terminal verdict and retries error/login cells.
 
 ## Run
 
@@ -51,22 +41,35 @@ node harvester.mjs ^
   --prompts  E:\Web\workspace\t-order-test\prompts.csv ^
   --aliases  "t-order,torder,torder.net" ^
   --out      E:\Web\workspace\t-order-test\monitor\rows_harvest_<YYYY-MM-DD>.json ^
-  --limit 3 --tabs 2
+  --engines chatgpt,gemini --limit 1
 ```
 
-Options: `--cdp <url>` `--limit N` `--tabs N` `--hl <lang>` `--timeout <s>`
-`--no-aio-grace <s>` `--gap-min/--gap-max <s>` `--resume`.
+Options: `--cdp <url>` (default `http://127.0.0.1:9222`; the pilot may sit on
+another port — read `C:\Users\MAXSON\gtm-pilot-chrome\DevToolsActivePort`),
+`--engines google,chatgpt,gemini,claude,grok` (default: google), `--limit N`,
+`--hl vi`, `--timeout 180`, `--gap-min/--gap-max <s>` (override every
+engine's built-in pacing), `--batch N --batch-gap <s>` (extra pause every N
+runs per engine, for overnight jobs), `--resume`.
 
-The output is a **partial rows file** (google cells only). To feed the
-dashboard, merge its google cells into the full dated `rows_<date>.json`
-(keep every other engine's existing cell) — a one-off merge is done in the
-weekly loop by the operator or a tiny script, never by overwriting the file.
+## Feeding the dashboard
 
-## Known v0.1 gaps (by design for the spike)
+The output is a **partial rows file** (only the engines that ran). To import
+it alongside a full run, merge harvested cells into the complete
+`rows_<date>.json` without ever overwriting it (importer join is verbatim on
+prompt text — same prompts, so cells land on the right prompts). The merge
+step is intentionally not written yet: finish live validation first.
 
-- `sentiment` stays empty (needs judgment; a later step can fill it from
-  `answer_text` without a browser).
-- `position` uses the prose rule only; no list-position analysis.
-- No evidence PNGs (render via `render_evidence.ps1` from `answer_text` as usual).
-- Google only. The other four engines need per-engine DOM work before joining.
-- `pages_cited` tags everything `(Google)`; correct today because only Google runs.
+## Status / known gaps
+
+- **google**: validated live (verdicts matched the T0 cell on shared prompts);
+  currently cooling down behind `/sorry` after the 2026-10-03 burst.
+- **chatgpt/gemini/claude/grok**: drivers written from SKILL.md mechanics,
+  zero live cells so far (the smoke attempt ran while the IP was already
+  CF-challenged). Re-smoke 1 prompt/engine once challenges clear, then a
+  full run before believing any numbers.
+- `sentiment` stays empty (needs judgment; fill from `answer_text` later).
+- `position` uses the prose rule only.
+- No evidence PNGs / xlsx from the harvester (render from `answer_text` with
+  `render_evidence.ps1` as usual).
+- web_queries: google from visible chips (raw); chat engines apply the v2.2
+  rule — links present but no visible searches → `["unavailable"]`, else `[]`.

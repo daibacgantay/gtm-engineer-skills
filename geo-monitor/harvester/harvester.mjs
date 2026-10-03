@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 /**
- * geo-harvester v0.1 (spike) — scripted Google AI Overview capture over CDP.
+ * geo-harvester v0.2 — scripted answer capture over CDP into the logged-in
+ * pilot Chrome. Google AIO + ChatGPT + Gemini + Claude + Grok.
  *
- * Attaches to the ALREADY-RUNNING pilot Chrome (connect-only; never launches,
- * never binds/kills the debugging port). Pulls prompts from a prompts.csv,
- * runs them in a small pool of tabs, and writes rows.json v2.2-compatible rows
- * (google cells: mentioned/position/answer_text/answer_links/web_queries).
+ * Round-robin model (mirrors the manual pilot's safe rhythm): one worker per
+ * engine, each worker runs the prompt list SEQUENTIALLY with per-engine
+ * human-like gaps. Engines are different services → different limits →
+ * parallel ACROSS engines is safe; parallel within one engine got the IP
+ * blocked on 2026-10-03 and stays behind a warning.
  *
- * Honors geo-monitor measurement laws: one fresh conversation per prompt
- * (fresh search URL, never a follow-up), verdict computed only from the
- * captured AIO slice (never page-wide scans), raw capture with no
- * fabrication — failed cells get marker values, not guesses.
+ * Attaches to the already-running pilot Chrome (connectOverCDP only; never
+ * launches, binds or kills the debugging port).
  *
- * Dead-end friendly: this directory is removable in one `rm -rf`; the pilot
- * manual (SKILL.md) remains the fallback path for every engine.
+ * Measurement laws: one fresh conversation per prompt; verdict computed ONLY
+ * from the captured slice; failures are markers (error/login_required),
+ * never guesses. rows.json v2.2-compatible; partial rows flushed per cell so
+ * --resume continues mid-run.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -35,9 +37,11 @@ const RELATED_MARKERS = [
 	"Mọi người cũng tìm kiếm",
 	"Mọi người tìm kiếm",
 ];
-const SELF_HOSTS = ["google.com", "gstatic.com", "googleusercontent.com"];
+const SELF_HOSTS = ["google.com", "gstatic.com", "googleusercontent.com", "gemini.google.com", "chatgpt.com", "claude.ai", "grok.com", "x.ai"];
 const BLOCK_PATTERN =
 	/unusual traffic|lưu lượng truy cập bất thường|not a robot|CAPTCHA|verify you are a human|kiểm tra xem bạn có đúng là người/i;
+const LOGIN_PATTERN =
+	/(please )?(log ?in|sign (in|up)|đăng nhập)/i;
 
 function arg(name, fallback) {
 	const i = process.argv.indexOf(`--${name}`);
@@ -51,36 +55,338 @@ const OPT = {
 	prompts: arg("prompts", undefined),
 	aliases: arg("aliases", undefined),
 	out: arg("out", undefined),
+	engines: String(arg("engines", "google"))
+		.split(",")
+		.map((e) => e.trim().toLowerCase())
+		.filter(Boolean),
 	limit: Number(arg("limit", "0")),
-	tabs: Math.max(1, Number(arg("tabs", "1"))),
 	hl: arg("hl", "vi"),
-	timeoutMs: Number(arg("timeout", "90")) * 1000,
-	noAioWaitMs: Number(arg("no-aio-grace", "15")) * 1000,
-	gapMinMs: Number(arg("gap-min", "30")) * 1000,
-	gapMaxMs: Number(arg("gap-max", "75")) * 1000,
+	gapMin: Number(arg("gap-min", "0")) * 1000,
+	gapMax: Number(arg("gap-max", "0")) * 1000,
 	batch: Math.max(0, Number(arg("batch", "0"))),
 	batchGapMs: Number(arg("batch-gap", "240")) * 1000,
+	timeoutMs: Number(arg("timeout", "180")) * 1000,
 	resume: arg("resume", false) === true,
 };
 
 if (!OPT.prompts || !OPT.aliases || !OPT.out) {
 	console.error(
 		"usage: node harvester.mjs --prompts <csv> --aliases \"a,b,c\" --out <rows.json> " +
-			"[--cdp http://127.0.0.1:9222] [--limit N] [--tabs 1] [--hl vi] [--timeout 90] " +
-			"[--gap-min 30] [--gap-max 75] [--batch N] [--batch-gap 240] [--resume]",
+			"[--cdp URL] [--engines google,chatgpt,gemini,claude,grok] [--limit N] [--hl vi] " +
+			"[--gap-min 30] [--gap-max 75] [--batch N] [--batch-gap 240] [--timeout 180] [--resume]",
 	);
 	process.exit(1);
 }
+/* ------------------------------------------------------------------ drivers */
 
-if (OPT.tabs > 1) {
-	console.error(
-		"[harvest] WARNING: concurrent AIO tabs tripped Google's IP-level 'unusual traffic' block " +
-			"on 2026-10-03. The manual round-robin never did because each engine saw one query every " +
-			"few minutes. Prefer --tabs 1 with gap pacing; only raise it if verified safe for this IP/account.",
-	);
+/** Helper: poll a page-bound async fn until it returns a non-empty stable text.
+ * minLen guards against pre-mature "stability" (e.g. prompt echo visible
+ * before the assistant reply starts streaming). */
+async function waitStream(page, read, { firstWaitMs = 6000, timeoutMs = OPT.timeoutMs, minLen = 200 }) {
+	const started = Date.now();
+	await page.waitForTimeout(firstWaitMs);
+	let lastLen = -1;
+	let stableSince = 0;
+	let text = "";
+	while (Date.now() - started < timeoutMs) {
+		const t = (await read().catch(() => "")) || "";
+		if (t.length >= minLen && t.length === lastLen && Date.now() - stableSince >= 5000) {
+			return { text: t, complete: true };
+		}
+		if (t.length !== lastLen) {
+			lastLen = t.length;
+			stableSince = Date.now();
+			text = t;
+		}
+		await page.waitForTimeout(2500);
+	}
+	return { text, complete: false };
 }
 
-// ---------------------------------------------------------------- prompts.csv
+function linksFrom(page, selector) {
+	return page
+		.evaluate((s) => {
+			let root = document;
+			if (s) {
+				const els = document.querySelectorAll(s);
+				root = els.length ? els[els.length - 1] : null;
+			}
+			return root ? [...root.querySelectorAll("a[href^='http']")].map((a) => a.href) : [];
+		}, selector)
+		.catch(() => []);
+}
+
+const DRIVERS = {
+	google: {
+		label: "Google",
+		gap: [30000, 75000],
+		async fresh(page, prompt) {
+			await page.goto(`https://www.google.com/search?q=${encodeURIComponent(prompt)}&hl=${OPT.hl}`, {
+				waitUntil: "domcontentloaded",
+				timeout: 60000,
+			});
+			await page.waitForTimeout(2500);
+			for (let i = 0; i < 2; i++) {
+				await page.mouse.wheel(0, 500).catch(() => {});
+				await page.waitForTimeout(1200);
+			}
+		},
+		async extract(page) {
+			if (/\/sorry\//.test(page.url()) || (await page.evaluate(() => (document.body?.innerText || "").slice(0, 4000))).match(BLOCK_PATTERN))
+				throw new Error("BLOCKED_CAPTCHA");
+			const hasResults = await page.evaluate(() => !!document.querySelector("#rso, #search, #rcnt, #botstuff"));
+			const data = await page.evaluate(
+				({ aioMarkers, relatedMarkers }) => {
+					const leafMatches = (el, markers) => {
+						if (el.children.length > 0) return false;
+						const t = (el.textContent || "").trim().toLowerCase();
+						if (!t || t.length > 80) return false;
+						return markers.some((m) => t.startsWith(m.toLowerCase()));
+					};
+					const findContainer = (markers, minLen) => {
+						for (const el of document.querySelectorAll("div, section")) {
+							if (!leafMatches(el, markers)) continue;
+							let node = el;
+							for (let hop = 0; hop < 10 && node; hop++) {
+								const len = (node.innerText || "").length;
+								if (len >= minLen && len <= 15000) return node;
+								node = node.parentElement;
+							}
+							return el.closest("div, section") || el.parentElement || el;
+						}
+						return null;
+					};
+					const aio = findContainer(aioMarkers, 400);
+					if (!aio) return null;
+					const text = (aio.innerText || "").trim();
+					const links = [...aio.querySelectorAll("a[href^='http']")].map((a) => a.href);
+					const chips = [];
+					const rel = findContainer(relatedMarkers, 10);
+					if (rel) {
+						const scope = rel.closest("div, section") || rel;
+						for (const line of (scope.innerText || "").split("\n")) {
+							const t = line.trim();
+							if (t && !relatedMarkers.some((m) => t.toLowerCase().startsWith(m.toLowerCase()))) chips.push(t);
+						}
+					}
+					return { text, links, chips };
+				},
+				{ aioMarkers: AIO_MARKERS, relatedMarkers: RELATED_MARKERS },
+			);
+			if (!data) {
+				if (!hasResults) throw new Error("NO_RESULTS_PAGE");
+				return { status: "no_ai_overview" };
+			}
+			return { status: "ok", text: data.text, links: data.links, webQueries: data.chips, truncated: false };
+		},
+	},
+
+	chatgpt: {
+		label: "ChatGPT",
+		gap: [90000, 180000],
+		async fresh(page) {
+			await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+			await page.waitForTimeout(4000);
+		},
+		async submit(page, prompt) {
+			const box = page.locator("#prompt-textarea").first();
+			await box.click({ timeout: 30000 });
+			await page.keyboard.insertText(prompt);
+			await page.waitForTimeout(600);
+			await page.keyboard.press("Enter");
+		},
+		async extract(page) {
+			if (await blockedHere(page)) throw new Error("BLOCKED_CAPTCHA");
+			// slice = last occurrence of the prompt → footer marker (skill-verified)
+			const { text, complete } = await waitStream(page, () =>
+				page.evaluate((p) => {
+					const body = document.body?.innerText || "";
+					const low = body.toLowerCase();
+					const i = low.lastIndexOf(p.toLowerCase());
+					if (i === -1) return "";
+					const endIdx = low.indexOf("chatgpt can make mistakes", i);
+					return (endIdx === -1 ? body.slice(i, i + 16000) : body.slice(i, endIdx)).trim();
+				}, prompt_of(page)),
+			);
+			if (!text) return { status: "error", why: "no answer slice found (selector drift?)" };
+			let links = await linksFrom(page, "[data-message-author-role='assistant']");
+			if (!links.length) links = await linksFrom(page, "main article");
+			return { status: "ok", text: text.slice(text.indexOf("\n") + 1), links: stripSelf(links), webQueries: [], truncated: !complete };
+		},
+	},
+
+	gemini: {
+		label: "Gemini",
+		gap: [90000, 180000],
+		async fresh(page) {
+			await page.goto("https://gemini.google.com/app", { waitUntil: "domcontentloaded", timeout: 60000 });
+			await page.waitForTimeout(4000);
+		},
+		async submit(page, prompt) {
+			const box = page.locator("div.ql-editor[contenteditable=true]").first();
+			await box.click({ timeout: 30000 });
+			await page.keyboard.insertText(prompt);
+			await page.waitForTimeout(600);
+			await page.keyboard.press("Enter");
+			// no navigation on failure: retry once if URL never gains a chat id (skill rule)
+			await page.waitForTimeout(6000);
+			if (!/gemini\.google\.com\/app\/[A-Za-z0-9]/.test(page.url())) {
+				await box.click().catch(() => {});
+				await page.keyboard.press("Enter");
+			}
+		},
+		async extract(page) {
+			if (await blockedHere(page)) throw new Error("BLOCKED_CAPTCHA");
+			const { text, complete } = await waitStream(page, () =>
+				page.evaluate(() => {
+					const mr = document.querySelector("model-response") || document.querySelector(".model-response-text");
+					return mr ? (mr.innerText || "").trim() : "";
+				}),
+			);
+			if (!text) return { status: "error", why: "no model-response element (drift?)" };
+			const links = await linksFrom(page, "model-response");
+			return { status: "ok", text, links: stripSelf(links), webQueries: [], truncated: !complete };
+		},
+	},
+
+	claude: {
+		label: "Claude",
+		gap: [90000, 180000],
+		async fresh(page) {
+			await page.goto("https://claude.ai/new", { waitUntil: "domcontentloaded", timeout: 60000 });
+			await page.waitForTimeout(6000);
+		},
+		async submit(page, prompt) {
+			const box = page.locator("div[contenteditable=true]").last();
+			await box.click({ timeout: 30000 });
+			await page.keyboard.insertText(prompt);
+			await page.waitForTimeout(600);
+			await page.keyboard.press("Enter");
+			// clarify card: click Skip if it shows up
+			await page.waitForTimeout(4000);
+			const skip = page.getByRole("button", { name: /skip/i }).first();
+			if (await skip.isVisible().catch(() => false)) await skip.click().catch(() => {});
+		},
+		async extract(page) {
+			if (await blockedHere(page)) throw new Error("BLOCKED_CAPTCHA");
+			const { text, complete } = await waitStream(page, () =>
+				page.evaluate(() => {
+					const msgs = document.querySelectorAll("[data-message-author-role='assistant']");
+					if (msgs.length) return (msgs[msgs.length - 1].innerText || "").trim();
+					return "";
+				}),
+			);
+			if (!text) return { status: "error", why: "no assistant message element (drift/login?)" };
+			const links = await linksFrom(page, "[data-message-author-role='assistant']");
+			return { status: "ok", text, links: stripSelf(links), webQueries: [], truncated: !complete };
+		},
+	},
+
+	grok: {
+		label: "Grok",
+		gap: [90000, 180000],
+		async fresh(page) {
+			await page.goto("https://grok.com/", { waitUntil: "domcontentloaded", timeout: 60000 });
+			await page.waitForTimeout(5000);
+		},
+		async submit(page, prompt) {
+			const box = page.locator("div[contenteditable=true]").first();
+			await box.click({ timeout: 30000 });
+			await page.keyboard.insertText(prompt);
+			await page.waitForTimeout(600);
+			await page.keyboard.press("Enter");
+			await page.waitForTimeout(6000);
+			if (!/grok\.com\/c\//.test(page.url())) {
+				await box.click().catch(() => {});
+				await page.keyboard.press("Enter");
+			}
+		},
+		async extract(page) {
+			if (await blockedHere(page)) throw new Error("BLOCKED_CAPTCHA");
+			const { text, complete } = await waitStream(page, () =>
+				page.evaluate(() => {
+					const msgs = document.querySelectorAll("[data-testid='message']");
+					if (!msgs.length) return "";
+					const last = msgs[msgs.length - 1];
+					const author = (last.getAttribute("data-author") || "").toLowerCase();
+					if (author && !author.includes("grok") && !author.includes("assistant")) return "";
+					return (last.innerText || "").trim();
+				}),
+			);
+			if (!text) return { status: "error", why: "no message element (drift/login?)" };
+			const links = await linksFrom(page, "[data-testid='message']");
+			return { status: "ok", text, links: stripSelf(links), webQueries: [], truncated: !complete };
+		},
+	},
+};
+
+/* ------------------------------------------------------------- shared utils */
+
+// chatgpt slice extraction needs the active prompt — tiny per-page stash
+const PAGE_PROMPT = new WeakMap();
+function prompt_of(page) {
+	return PAGE_PROMPT.get(page) || "";
+}
+
+async function blockedHere(page) {
+	if (/\/sorry\//.test(page.url())) return true;
+	const t = await page.evaluate(() => (document.body?.innerText || "").slice(0, 4000)).catch(() => "");
+	return BLOCK_PATTERN.test(t);
+}
+async function loginHere(page) {
+	const t = await page.evaluate(() => (document.body?.innerText || "").slice(0, 3000)).catch(() => "");
+	return LOGIN_PATTERN.test(t) && t.length < 3000;
+}
+
+function stripSelf(links) {
+	return links.filter((l) => {
+		try {
+			const h = new URL(l).hostname.toLowerCase();
+			return !SELF_HOSTS.some((s) => h === s || h.endsWith(`.${s}`));
+		} catch {
+			return false;
+		}
+	});
+}
+
+function cleanLinks(links) {
+	const seen = new Set();
+	const out = [];
+	for (const raw of links) {
+		try {
+			const u = new URL(raw);
+			if (u.protocol !== "http:" && u.protocol !== "https:") continue;
+			const host = u.hostname.toLowerCase().replace(/^www\./, "");
+			if (SELF_HOSTS.some((h) => host === h || h.endsWith(`.${h}`))) continue;
+			u.search = "";
+			u.hash = "";
+			const url = u.toString();
+			if (seen.has(url)) continue;
+			seen.add(url);
+			out.push(url);
+		} catch {
+			/* skip */
+		}
+	}
+	return out;
+}
+
+function verdict(text, aliases) {
+	const low = text.toLowerCase();
+	let idx = -1;
+	for (const a of aliases) {
+		const i = low.indexOf(a.toLowerCase());
+		if (i !== -1 && (idx === -1 || i < idx)) idx = i;
+	}
+	if (idx === -1) return { mentioned: "no", position: "" };
+	const words = text.slice(0, idx).split(/\s+/).filter(Boolean).length;
+	const total = Math.max(text.split(/\s+/).filter(Boolean).length, 1);
+	const ratio = words / total;
+	return { mentioned: "yes", position: ratio <= 1 / 3 ? "top" : ratio <= 2 / 3 ? "middle" : "bottom" };
+}
+
+/* ------------------------------------------------------------------ prompts */
+
 function parseCsv(text) {
 	const rows = [];
 	let row = [];
@@ -128,173 +434,16 @@ function loadPrompts(file) {
 	return out;
 }
 
-// ---------------------------------------------------------------- verdict math
-function verdict(text, aliases) {
-	const low = text.toLowerCase();
-	let idx = -1;
-	for (const a of aliases) {
-		const i = low.indexOf(a.toLowerCase());
-		if (i !== -1 && (idx === -1 || i < idx)) idx = i;
+/* --------------------------------------------------------------------- main */
+
+for (const e of OPT.engines) {
+	if (!DRIVERS[e]) {
+		console.error(`[harvest] unknown engine '${e}' (have: ${Object.keys(DRIVERS).join(", ")})`);
+		process.exit(1);
 	}
-	if (idx === -1) return { mentioned: "no", position: "" };
-	const words = text.slice(0, idx).split(/\s+/).filter(Boolean).length;
-	const total = Math.max(text.split(/\s+/).filter(Boolean).length, 1);
-	const ratio = words / total;
-	return { mentioned: "yes", position: ratio <= 1 / 3 ? "top" : ratio <= 2 / 3 ? "middle" : "bottom" };
 }
 
-function cleanLinks(links) {
-	const seen = new Set();
-	const out = [];
-	for (const raw of links) {
-		let url = raw;
-		try {
-			const u = new URL(raw);
-			if (u.protocol !== "http:" && u.protocol !== "https:") continue;
-			const host = u.hostname.toLowerCase().replace(/^www\./, "");
-			if (SELF_HOSTS.some((h) => host === h || host.endsWith(`.${h}`))) continue;
-			u.search = "";
-			u.hash = "";
-			url = u.toString();
-		} catch {
-			continue;
-		}
-		if (seen.has(url)) continue;
-		seen.add(url);
-		out.push(url);
-	}
-	return out;
-}
-
-// ---------------------------------------------------------------- browser side
-async function extractAio(page) {
-	return page.evaluate(
-		({ aioMarkers, relatedMarkers }) => {
-			const leafMatches = (el, markers) => {
-				if (el.children.length > 0) return false;
-				const t = (el.textContent || "").trim().toLowerCase();
-				if (!t || t.length > 80) return false;
-				return markers.some((m) => t.startsWith(m.toLowerCase()));
-			};
-			const findContainer = (markers, minLen) => {
-				const els = document.querySelectorAll("div, section");
-				for (const el of els) {
-					if (!leafMatches(el, markers)) continue;
-					let node = el;
-					for (let hop = 0; hop < 10 && node; hop++) {
-						const len = (node.innerText || "").length;
-						if (len >= minLen && len <= 15000) return node;
-						node = node.parentElement;
-					}
-					return el.closest("div, section") || el.parentElement || el;
-				}
-				return null;
-			};
-			const aio = findContainer(aioMarkers, 400);
-			if (!aio) return null;
-			const text = (aio.innerText || "").trim();
-			if (!text) return null;
-			const links = [...aio.querySelectorAll("a[href^='http']")].map((a) => a.href);
-			const chips = [];
-			const rel = findContainer(relatedMarkers, 10);
-			if (rel) {
-				const scope = rel.closest("div, section") || rel;
-				for (const line of (scope.innerText || "").split("\n")) {
-					const t = line.trim();
-					if (t && !relatedMarkers.some((m) => t.toLowerCase().startsWith(m.toLowerCase()))) chips.push(t);
-				}
-			}
-			return { text, links, chips };
-		},
-		{ aioMarkers: AIO_MARKERS, relatedMarkers: RELATED_MARKERS },
-	);
-}
-
-async function pageLooksBlocked(page) {
-	if (/\/sorry\//.test(page.url())) return true;
-	const text = await page.evaluate(() => (document.body?.innerText || "").slice(0, 4000));
-	return BLOCK_PATTERN.test(text);
-}
-
-/** Distinguishes a real (if AIO-less) SERP from a failed/blank/consent page. */
-async function pageHasSearchResults(page) {
-	return page.evaluate(() => {
-		if (document.querySelector("#rso, #search, #rcnt, #botstuff")) return true;
-		return (document.body?.innerText || "").length > 800;
-	});
-}
-
-async function runPrompt(page, prompt) {
-	const url = `https://www.google.com/search?q=${encodeURIComponent(prompt)}&hl=${OPT.hl}`;
-	await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-	await page.waitForTimeout(2500);
-	if (await pageLooksBlocked(page)) throw new Error("BLOCKED_CAPTCHA");
-	if (!(await pageHasSearchResults(page))) throw new Error("NO_RESULTS_PAGE");
-
-	const started = Date.now();
-	let last = null;
-	let lastLen = -1;
-	let stableSince = 0;
-	while (Date.now() - started < OPT.timeoutMs) {
-		await page.mouse.wheel(0, 400).catch(() => {});
-		const data = await extractAio(page);
-		if (data) {
-			last = data;
-			if (data.text.length === lastLen && Date.now() - stableSince >= 4000) break;
-			if (data.text.length !== lastLen) {
-				lastLen = data.text.length;
-				stableSince = Date.now();
-			}
-		} else if (Date.now() - started > OPT.noAioWaitMs) {
-			last = null;
-			break;
-		}
-		await page.waitForTimeout(2000);
-	}
-	if (!last) return { status: "no_ai_overview" };
-	const truncated = Date.now() - stableSince < 4000;
-	return { status: "ok", data: last, truncated };
-}
-
-// ---------------------------------------------------------------- orchestration
-function emptyCell(why) {
-	return { mentioned: why, position: "", sentiment: "", img: null };
-}
-
-function buildRow(prompt, result, aliases) {
-	if (result.status === "no_ai_overview") {
-		return {
-			prompt,
-			branded: false,
-			engines: { google: { ...emptyCell("no_ai_overview"), note: "harvest v0.1: no AIO block" } },
-			any_mentioned: "no",
-			pages_cited: [],
-			notes: `harvested v0.1 (google) ${new Date().toISOString()}`,
-		};
-	}
-	const { data } = result;
-	const v = verdict(data.text, aliases);
-	const links = cleanLinks(data.links);
-	const row = {
-		prompt,
-		branded: false,
-		engines: {
-			google: {
-				mentioned: v.mentioned,
-				position: v.position,
-				sentiment: "",
-				answer_text: data.text,
-				answer_links: links,
-				web_queries: data.chips,
-				img: null,
-			},
-		},
-		any_mentioned: v.mentioned,
-		pages_cited: links.map((u) => `${u} (Google)`),
-		notes: `harvested v0.1 (google)${result.truncated ? " TRUNCATED: stream not stable" : ""} ${new Date().toISOString()}`,
-	};
-	return row;
-}
+const DONE = new Set(["yes", "no", "no_ai_overview"]);
 
 async function main() {
 	const aliases = OPT.aliases
@@ -307,97 +456,130 @@ async function main() {
 	if (OPT.limit > 0) prompts = prompts.slice(0, OPT.limit);
 
 	const outFile = resolve(OPT.out);
-	const rows = [];
-	const done = new Map();
+	const rows = new Map();
 	if (OPT.resume && existsSync(outFile)) {
 		for (const r of JSON.parse(readFileSync(outFile, "utf8"))) {
-			const cell = r.engines?.google;
-			if (cell && ["yes", "no", "no_ai_overview"].includes(cell.mentioned)) {
-				done.set(r.prompt, r);
-				rows.push(r);
-			}
+			rows.set(r.prompt, r);
 		}
 	}
-	const queue = prompts.filter((p) => !done.has(p));
-	console.error(`[harvest] ${prompts.length} prompts (${done.size} resumed, ${queue.length} pending) × ${OPT.tabs} tabs`);
+	const flush = () => {
+		writeFileSync(outFile, JSON.stringify([...rows.values()], null, 1), "utf8");
+	};
 
-	if (queue.length === 0) {
-		console.error("[harvest] nothing to run");
-		return 0;
-	}
+	console.error(
+		`[harvest] ${prompts.length} prompts × engines [${OPT.engines.join(", ")}] — sequential per engine, parallel across`,
+	);
 
 	const browser = await chromium.connectOverCDP(OPT.cdp);
 	const context = browser.contexts()[0];
 	const startedAt = Date.now();
-	let completed = 0;
-	let blocked = false;
 
-	const flush = () => {
-		writeFileSync(outFile, JSON.stringify(rows, null, 1), "utf8");
-	};
-
-	async function worker(idx) {
+	// one worker per engine; engines are separate services, so running them
+	// side by side each at its own gentle pace is the safe parallelism.
+	const workers = OPT.engines.map(async (engineName, wIdx) => {
+		const driver = DRIVERS[engineName];
 		const page = await context.newPage();
 		await page.setViewportSize({ width: 1440, height: 900 });
-		while (queue.length > 0 && !blocked) {
-			const prompt = queue.shift();
+		let completed = 0;
+		let consecErrors = 0;
+		for (const prompt of prompts) {
+			const prior = rows.get(prompt)?.engines?.[engineName];
+			if (prior && DONE.has(prior.mentioned)) continue;
+
+			const [gMin, gMax] = OPT.gapMin > 0 || OPT.gapMax > 0 ? [OPT.gapMin, OPT.gapMax] : driver.gap;
+			await page.waitForTimeout(Math.random() * 15000 + wIdx * 15000);
+
+			let next;
 			const t0 = Date.now();
-			let row;
 			try {
-				const result = await runPrompt(page, prompt);
-				row = buildRow(prompt, result, aliases);
-			} catch (err) {
-				if (String(err?.message).startsWith("BLOCKED_CAPTCHA")) {
-					blocked = true;
-					console.error(`[harvest] tab${idx}: BLOCKED_CAPTCHA — stopping run (human job, not the script's)`);
-					break;
+				await driver.fresh(page, prompt);
+				if (driver.submit) {
+					// blank/under-300 body after fresh = challenge page, not a real session
+					let blen = await page.evaluate(() => (document.body?.innerText || "").length).catch(() => 0);
+					if (blen < 300) {
+						await page.waitForTimeout(5000);
+						blen = await page.evaluate(() => (document.body?.innerText || "").length).catch(() => 0);
+					}
+					if (blen < 300) throw new Error("EMPTY_PAGE (challenge/blank — bot check active?)");
 				}
-				row = {
-					prompt,
-					branded: false,
-					engines: { google: { ...emptyCell("error"), note: `harvest v0.1: ${String(err?.message).slice(0, 120)}` } },
-					any_mentioned: "no",
-					pages_cited: [],
-					notes: `harvested v0.1 (google) ERROR ${new Date().toISOString()}`,
-				};
+				if (await loginHere(page)) throw new Error("NEEDS_LOGIN");
+				if (driver.submit) {
+					PAGE_PROMPT.set(page, prompt);
+					await driver.submit(page, prompt);
+				}
+				const res = await driver.extract(page);
+				if (res.status === "no_ai_overview") {
+					next = { mentioned: "no_ai_overview", position: "", sentiment: "", img: null, note: "no AIO block" };
+				} else if (res.status === "error") {
+					next = { mentioned: "error", position: "", sentiment: "", img: null, note: res.why };
+				} else {
+					const v = verdict(res.text, aliases);
+					const links = cleanLinks(res.links);
+					const webQ = res.webQueries && res.webQueries.length > 0 ? res.webQueries : links.length > 0 ? ["unavailable"] : [];
+					next = {
+						mentioned: v.mentioned,
+						position: v.position,
+						sentiment: "",
+						answer_text: res.text,
+						answer_links: links,
+						web_queries: webQ,
+						img: null,
+					};
+					if (res.truncated) next.note = "truncated: stream not stable within timeout";
+				}
+			} catch (err) {
+				const msg = String(err?.message || err).slice(0, 140);
+				if (msg.startsWith("BLOCKED_CAPTCHA")) next = { mentioned: "error", note: "blocked page (unusual traffic/CAPTCHA)" };
+				else if (msg.startsWith("NEEDS_LOGIN")) next = { mentioned: "login_required", note: "login wall appeared" };
+				else next = { mentioned: "error", note: msg };
 			}
-			rows.push(row);
+
+			row.engines[engineName] = next;
+			const cells = Object.values(row.engines);
+			row.any_mentioned = cells.some((c) => c.mentioned === "yes")
+				? "yes"
+				: cells.every((c) => DONE.has(c.mentioned))
+					? "no"
+					: "";
+			row.pages_cited = Object.entries(row.engines).flatMap(([e, c]) =>
+				(c.answer_links || []).map((u) => `${u} (${engineName})`),
+			);
+			row.notes = `harvested v0.2 (${engineName}) ${new Date().toISOString()}`;
+			rows.set(prompt, row);
 			completed++;
-			const m = row.engines.google.mentioned;
-			const len = row.engines.google.answer_text?.length ?? 0;
 			console.error(
-				`[harvest] tab${idx} ${completed}/${prompts.length} (${Math.round((Date.now() - startedAt) / 1000)}s elapsed) ` +
-					`"${prompt.slice(0, 44)}" → ${m}${m === "yes" ? "/" + row.engines.google.position : ""} len=${len} chips=${row.engines.google.web_queries?.length ?? 0}`,
+				`[harvest:${engineName}] ${completed}/${prompts.length} (${((Date.now() - t0) / 1000).toFixed(0)}s) ` +
+					`"${prompt.slice(0, 40)}" → ${next.mentioned}${next.position ? "/" + next.position : ""}`,
 			);
 			flush();
-			if (OPT.batch > 0 && completed % OPT.batch === 0 && queue.length > 0) {
-				const pause = Math.round(OPT.batchGapMs * (0.8 + Math.random() * 0.4));
-				console.error(`[harvest] batch pause ${Math.round(pause / 1000)}s after ${completed} runs`);
-				await page.waitForTimeout(pause);
+
+			consecErrors = next.mentioned === "error" || next.mentioned === "login_required" ? consecErrors + 1 : 0;
+			if (next.mentioned === "login_required") {
+				console.error(`[harvest:${engineName}] STOP: login wall — human needed; other engines continue`);
+				break;
+			}
+			if (consecErrors >= 2) {
+				console.error(
+					`[harvest:${engineName}] STOP: 2 consecutive errors — circuit breaker halted this engine (challenge/rate limit?); other engines continue. Re-run later with --resume.`,
+				);
+				break;
+			}
+			if (OPT.batch > 0 && completed % OPT.batch === 0) {
+				await page.waitForTimeout(Math.round(OPT.batchGapMs * (0.8 + Math.random() * 0.4)));
 			} else {
-				await page.waitForTimeout(OPT.gapMinMs + Math.random() * Math.max(0, OPT.gapMaxMs - OPT.gapMinMs));
+				await page.waitForTimeout(gMin + Math.random() * Math.max(0, gMax - gMin));
 			}
 		}
 		await page.close().catch(() => {});
-	}
+	});
 
-	try {
-		await Promise.all(Array.from({ length: Math.min(OPT.tabs, queue.length) }, (_, i) => worker(i)));
-	} finally {
-		await browser.close().catch(() => {});
-	}
+	await Promise.all(workers);
+	await browser.close().catch(() => {});
 	flush();
-	const mins = ((Date.now() - startedAt) / 60000).toFixed(1);
-	console.error(
-		`[harvest] done: ${completed} run in ${mins} min, ${blocked ? "STOPPED on CAPTCHA/blocked page — resume later with --resume; " : ""}rows → ${outFile}`,
-	);
-	return blocked ? 2 : 0;
+	console.error(`[harvest] done in ${((Date.now() - startedAt) / 60000).toFixed(1)} min → ${outFile}`);
 }
 
-main().then(
-	(code) => process.exit(code),
-	(err) => {
-		console.error(`[harvest] fatal: ${err?.stack || err}`);
-		process.exit(1);
-	},
-);
+main().catch((err) => {
+	console.error(`[harvest] fatal: ${err?.stack || err}`);
+	process.exit(1);
+});
