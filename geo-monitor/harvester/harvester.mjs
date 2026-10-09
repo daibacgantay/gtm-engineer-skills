@@ -67,6 +67,7 @@ const OPT = {
 	batchGapMs: Number(arg("batch-gap", "240")) * 1000,
 	timeoutMs: Number(arg("timeout", "180")) * 1000,
 	resume: arg("resume", false) === true,
+	redo: String(arg("redo", "")).split(",").map((e) => e.trim().toLowerCase()).filter(Boolean),
 };
 
 if (!OPT.prompts || !OPT.aliases || !OPT.out) {
@@ -82,7 +83,7 @@ if (!OPT.prompts || !OPT.aliases || !OPT.out) {
 /** Helper: poll a page-bound async fn until it returns a non-empty stable text.
  * minLen guards against pre-mature "stability" (e.g. prompt echo visible
  * before the assistant reply starts streaming). */
-async function waitStream(page, read, { firstWaitMs = 6000, timeoutMs = OPT.timeoutMs, minLen = 200 }) {
+async function waitStream(page, read, { firstWaitMs = 6000, timeoutMs = OPT.timeoutMs, minLen = 200 } = {}) {
 	const started = Date.now();
 	await page.waitForTimeout(firstWaitMs);
 	let lastLen = -1;
@@ -144,7 +145,9 @@ const DRIVERS = {
 						return markers.some((m) => t.startsWith(m.toLowerCase()));
 					};
 					const findContainer = (markers, minLen) => {
-						for (const el of document.querySelectorAll("div, section")) {
+						// leaf may be STRONG/SPAN/Hn (Google wraps the marker) —
+						// div/section-only search misses it → false no_ai_overview (2026-10-03)
+						for (const el of document.querySelectorAll("div, section, span, strong, h1, h2, h3, h4")) {
 							if (!leafMatches(el, markers)) continue;
 							let node = el;
 							for (let hop = 0; hop < 10 && node; hop++) {
@@ -269,16 +272,26 @@ const DRIVERS = {
 		},
 		async extract(page) {
 			if (await blockedHere(page)) throw new Error("BLOCKED_CAPTCHA");
+			// slice = last occurrence of the prompt → footer marker.
+			// [data-message-author-role] died in the 2026-09 DOM drift; slice
+			// is the skill-verified fallback (pure-MCP smoke 2026-10-03).
 			const { text, complete } = await waitStream(page, () =>
-				page.evaluate(() => {
-					const msgs = document.querySelectorAll("[data-message-author-role='assistant']");
-					if (msgs.length) return (msgs[msgs.length - 1].innerText || "").trim();
-					return "";
-				}),
+				page.evaluate((p) => {
+					const body = document.body?.innerText || "";
+					const low = body.toLowerCase();
+					const i = low.lastIndexOf(p.toLowerCase());
+					if (i === -1) return "";
+					return body.slice(i, i + 16000).trim();
+				}, prompt_of(page)),
 			);
-			if (!text) return { status: "error", why: "no assistant message element (drift/login?)" };
-			const links = await linksFrom(page, "[data-message-author-role='assistant']");
-			return { status: "ok", text, links: stripSelf(links), webQueries: [], truncated: !complete };
+			if (!text) return { status: "error", why: "no answer slice found (login?)" };
+			let answer = text.slice(text.indexOf("\n") + 1).trim();
+			const foot = answer.toLowerCase().indexOf("claude is ai and can make mistakes");
+			if (foot > 200) answer = answer.slice(0, foot).trim();
+			if (!answer) return { status: "error", why: "slice empty after trim" };
+			// own-domain links (sidebar history) die in stripSelf; sources stay
+			const links = await linksFrom(page, null);
+			return { status: "ok", text: answer, links: stripSelf(links), webQueries: [], truncated: !complete };
 		},
 	},
 
@@ -303,19 +316,23 @@ const DRIVERS = {
 		},
 		async extract(page) {
 			if (await blockedHere(page)) throw new Error("BLOCKED_CAPTCHA");
+			// slice = last occurrence of the prompt → length cap.
+			// [data-testid='message'] matching proved unreliable; slice is the
+			// skill-verified fallback (pure-MCP smoke 2026-10-03).
 			const { text, complete } = await waitStream(page, () =>
-				page.evaluate(() => {
-					const msgs = document.querySelectorAll("[data-testid='message']");
-					if (!msgs.length) return "";
-					const last = msgs[msgs.length - 1];
-					const author = (last.getAttribute("data-author") || "").toLowerCase();
-					if (author && !author.includes("grok") && !author.includes("assistant")) return "";
-					return (last.innerText || "").trim();
-				}),
+				page.evaluate((p) => {
+					const body = document.body?.innerText || "";
+					const low = body.toLowerCase();
+					const i = low.lastIndexOf(p.toLowerCase());
+					if (i === -1) return "";
+					return body.slice(i, i + 16000).trim();
+				}, prompt_of(page)),
 			);
-			if (!text) return { status: "error", why: "no message element (drift/login?)" };
-			const links = await linksFrom(page, "[data-testid='message']");
-			return { status: "ok", text, links: stripSelf(links), webQueries: [], truncated: !complete };
+			if (!text) return { status: "error", why: "no answer slice found (login?)" };
+			const answer = text.slice(text.indexOf("\n") + 1).trim();
+			if (!answer) return { status: "error", why: "slice empty after trim" };
+			const links = await linksFrom(page, null);
+			return { status: "ok", text: answer, links: stripSelf(links), webQueries: [], truncated: !complete };
 		},
 	},
 };
@@ -462,6 +479,21 @@ async function main() {
 			rows.set(r.prompt, r);
 		}
 	}
+	// --redo <engines>: drop those engines' cells so they run again.
+	// For driver fixes that invalidate old verdicts (e.g. false
+	// no_ai_overview) — resume alone would skip them as terminal.
+	for (const r of rows.values()) {
+		for (const e of OPT.redo) delete r?.engines?.[e];
+	}
+	// Pre-create every row BEFORE workers start: parallel workers must only
+	// MUTATE shared row objects. Lazy get-or-create races (two workers both
+	// see undefined, both build fresh objects, last set() wins and eats the
+	// other engine's cell — observed 2026-10-03: split single-engine rows).
+	for (const p of prompts) {
+		if (!rows.has(p)) {
+			rows.set(p, { prompt: p, branded: false, engines: {}, any_mentioned: "", pages_cited: [], notes: "" });
+		}
+	}
 	const flush = () => {
 		writeFileSync(outFile, JSON.stringify([...rows.values()], null, 1), "utf8");
 	};
@@ -485,6 +517,10 @@ async function main() {
 		for (const prompt of prompts) {
 			const prior = rows.get(prompt)?.engines?.[engineName];
 			if (prior && DONE.has(prior.mentioned)) continue;
+
+			// per-prompt row: pre-created before workers started (see above);
+			// just take the shared object — never build here (race).
+			const row = rows.get(prompt);
 
 			const [gMin, gMax] = OPT.gapMin > 0 || OPT.gapMax > 0 ? [OPT.gapMin, OPT.gapMax] : driver.gap;
 			await page.waitForTimeout(Math.random() * 15000 + wIdx * 15000);
@@ -524,6 +560,7 @@ async function main() {
 						answer_links: links,
 						web_queries: webQ,
 						img: null,
+						chat_url: page.url(), // janitor wipe key: exact conversation URL
 					};
 					if (res.truncated) next.note = "truncated: stream not stable within timeout";
 				}
@@ -574,9 +611,12 @@ async function main() {
 	});
 
 	await Promise.all(workers);
-	await browser.close().catch(() => {});
+	// NOTE: never browser.close() here — this is a SHARED pilot over CDP;
+	// close() would kill the whole browser (and the user's session with it).
+	// Workers already closed their own pages; exiting drops our CDP connection.
 	flush();
 	console.error(`[harvest] done in ${((Date.now() - startedAt) / 60000).toFixed(1)} min → ${outFile}`);
+	process.exit(0); // CDP connection would keep the loop alive otherwise
 }
 
 main().catch((err) => {
